@@ -41,11 +41,7 @@ pip install streamlit pandas requests plotly xlsxwriter
 
 ## ▶️ Usage
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/yourusername/kobotoolbox-logs-viewer.git
-   cd kobotoolbox-logs-viewer
-   ```
+1. Download this repository:
 
 2. Run the app:
    ```bash
