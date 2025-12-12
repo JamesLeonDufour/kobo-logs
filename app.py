@@ -1,21 +1,21 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time 
 import plotly.express as px
 import plotly.graph_objects as go
 import io
 import math
 import json
-import time
 from typing import List, Dict, Optional, Tuple
 
 # --- Configuration ---
 DISPLAY_TIMEZONE = 'Europe/Brussels'
-PAGE_SIZE = 10000 # Logs fetched per page
+# Page size is 1000 for better reliability and responsiveness
+PAGE_SIZE = 1000 
 REQUEST_TIMEOUT = 90 # seconds
 
-# ---- Project History: all actions & per-action fields ----
+# ---- Project History: all actions & per-action fields (unchanged) ----
 PROJECT_HISTORY_ACTIONS = [
     "add-media",
     "add-submission",
@@ -53,7 +53,7 @@ PROJECT_HISTORY_ACTIONS = [
     "update-qa",
 ]
 
-# Per-action filterable fields for Project History Logs
+# Per-action filterable fields for Project History Logs (unchanged)
 ACTION_FIELD_MAP: Dict[str, List[Tuple[str, str]]] = {
     "add-media": [
         ("metadata__asset-file__uid", "Asset File UID"),
@@ -148,8 +148,9 @@ ACTION_FIELD_MAP: Dict[str, List[Tuple[str, str]]] = {
     "update-qa": [],
 }
 
-# API Endpoints Configuration with comprehensive filters
+# API Endpoints Configuration with comprehensive filters (unchanged)
 API_ENDPOINTS = {
+    # Audit Logs (NO count, uses 'next' for pagination)
     "Audit Logs": {
         "path": "/api/v2/audit-logs/",
         "filters": {
@@ -162,8 +163,9 @@ API_ENDPOINTS = {
                 ("metadata__ip_address", "IP Address")
             ]
         },
-        "offset_pagination": False
+        "offset_pagination": False # DRF style pagination (next/previous)
     },
+    # Project History Logs (HAS count in first response, uses offset for pagination)
     "Project History Logs": {
         "path": "/api/v2/project-history-logs/",
         "filters": {
@@ -171,7 +173,7 @@ API_ENDPOINTS = {
             "log_types": [],
             "metadata_fields": []
         },
-        "offset_pagination": True,
+        "offset_pagination": True, # Offset/Limit style pagination (with count)
         "common_fields": [
             ("user_uid", "User UID"),
             ("user__email", "User Email"),
@@ -183,6 +185,7 @@ API_ENDPOINTS = {
             ("action", "Action") # This is handled by multiselect
         ]
     },
+    # Access Logs (NO count, uses 'next' for pagination)
     "Access Logs": {
         "path": "/api/v2/access-logs/",
         "filters": {
@@ -195,12 +198,12 @@ API_ENDPOINTS = {
                 ("metadata__ip_address", "IP Address")
             ]
         },
-        "offset_pagination": False
+        "offset_pagination": False # DRF style pagination (next/previous)
     }
 }
 
 
-# Date range presets
+# Date range presets (unchanged)
 DATE_PRESETS = {
     "Today": 0,
     "Last 7 days": 7,
@@ -212,7 +215,7 @@ DATE_PRESETS = {
     "Custom": None
 }
 
-# --- Helper Functions ---
+# --- Helper Functions (Updated) ---
 def validate_server_url(url: str) -> Tuple[bool, str]:
     url = url.strip().rstrip('/')
     if not url.startswith(('http://', 'https://')):
@@ -247,9 +250,7 @@ def build_query(
     asset_uid: str = "",
     extra_filters: Optional[Dict[str, str]] = None
 ) -> str:
-    """Build query string from filters following KoboToolbox API format.
-       Note: For endpoints where actions are empty, no 'action' filter will be added,
-       fetching all actions naturally."""
+    """Build query string from filters following KoboToolbox API format."""
     query_parts = []
 
     # Actions
@@ -268,12 +269,22 @@ def build_query(
             log_type_query = " OR ".join([f"log_type:{t}" for t in selected_log_types])
             query_parts.append(f"({log_type_query})")
 
-    # Date filters
+    # Date and Time filters (STRICTLY DATE-BASED)
+    
+    # 1. GTE Filter (Start Date - 00:00)
     if start_date is not None:
-        query_parts.append(f'date_created__gte:"{start_date.strftime("%Y-%m-%d")} 00:00"')
+        # Start at 00:00 on the selected start date
+        start_datetime_str = f"{start_date.strftime('%Y-%m-%d')} 00:00"
+        query_parts.append(f'date_created__gte:"{start_datetime_str}"')
+    
+    # 2. LT Filter (End Date - Full Day Coverage)
     if end_date is not None:
-        next_day = end_date + pd.Timedelta(days=1)
-        query_parts.append(f'date_created__lt:"{next_day.strftime("%Y-%m-%d")} 00:00"')
+        # Advance the end date by one day and set time to 00:00.
+        # This ensures all logs up to 23:59:59 on the selected end_date are included.
+        end_datetime_boundary = end_date + timedelta(days=1)
+        end_datetime_str = f"{end_datetime_boundary.strftime('%Y-%m-%d')} 00:00"
+        query_parts.append(f'date_created__lt:"{end_datetime_str}"')
+
 
     # Legacy convenience filters (only username is always checked)
     if username:
@@ -304,42 +315,57 @@ def get_api_headers(api_key: str) -> Dict[str, str]:
         "Accept": "application/json"
     }
 
-def get_total_count(api_url: str, api_key: str, query_string: str) -> int:
-    headers = get_api_headers(api_key)
-    params = {"format": "json", "limit": 1}
-    if query_string:
-        params["q"] = query_string
-    try:
-        response = requests.get(api_url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("count", 0)
-    except requests.exceptions.Timeout:
-        raise Exception("Request timed out. Please try again.")
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"API request failed: {str(e)}")
-
 def fetch_logs_paginated(
     api_url: str,
     api_key: str,
     query_string: str,
-    total_count: int,
     use_offset_pagination: bool
-) -> List[Dict]:
-    """Fetch all logs with pagination and progress tracking."""
+) -> Tuple[List[Dict], Optional[int]]:
+    """
+    Fetch all logs with pagination and progress tracking. 
+    Returns logs and final count (if known/fetched).
+    """
     headers = get_api_headers(api_key)
     logs: List[Dict] = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total_count: Optional[int] = None 
 
     try:
         if use_offset_pagination:
-            # Explicit offset/limit pagination (Project History Logs)
+            # === Project History Logs (Offset Pagination with COUNT in first response) ===
+            
+            # 1. Fetch the first full page (offset 0) to get the reliable count and initial results
+            status_text.text(f"Fetching first page (limit {PAGE_SIZE:,}) to determine total logs...")
+            params = {"format": "json", "limit": PAGE_SIZE, "offset": 0}
+            if query_string:
+                params["q"] = query_string
+            
+            response = requests.get(api_url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Use the count from the first response
+            total_count = data.get("count", 0) 
+            logs.extend(data.get("results", []))
+            
+            if total_count == 0:
+                progress_bar.empty()
+                status_text.empty()
+                return [], 0 
+            
             total_pages = math.ceil(total_count / PAGE_SIZE)
-            for page in range(total_pages):
+
+            if total_count > PAGE_SIZE:
+                 st.warning(f"⚠️ Found {total_count:,} logs. Fetching will require {total_pages} requests. This may take some time.")
+            
+            progress_bar.progress(min(1.0, 1 / total_pages)) # Initial progress for first page
+
+            # 2. Continue fetching remaining pages (starting from page index 1)
+            for page in range(1, total_pages):
                 offset = page * PAGE_SIZE
                 status_text.text(f"Fetching page {page + 1}/{total_pages} "
-                                 f"(offset {offset:,}, {len(logs):,} logs so far)...")
+                                    f"(offset {offset:,}, {len(logs):,} logs so far)...")
                 params = {"format": "json", "limit": PAGE_SIZE, "offset": offset}
                 if query_string:
                     params["q"] = query_string
@@ -349,42 +375,39 @@ def fetch_logs_paginated(
                 logs.extend(data.get("results", []))
                 progress_bar.progress((page + 1) / total_pages)
         else:
-            # DRF next/previous pagination (Audit & Access Logs)
-            next_url = api_url
+            # === Audit & Access Logs (DRF Next/Previous Pagination - NO COUNT) ===
+            next_url: Optional[str] = api_url
             params = {"format": "json", "limit": PAGE_SIZE}
             if query_string:
                 params["q"] = query_string
-            fetched = 0
-            # If we know total_count, estimate pages for progress bar
-            total_pages = max(1, math.ceil(total_count / PAGE_SIZE))
+            
+            page_index = 0
             while next_url:
-                page_index = min(total_pages, max(1, math.ceil((fetched + 1) / PAGE_SIZE)))
-                status_text.text(f"Fetching page {page_index}/{total_pages} "
-                                 f"({len(logs):,} logs so far)...")
+                page_index += 1
+                status_text.text(f"Fetching page {page_index} ({len(logs):,} logs so far)...")
                 
-                # If next_url is provided by DRF, use it directly without re-adding params
-                if next_url != api_url and next_url.startswith(api_url):
-                    # For DRF pagination, the 'next' URL is absolute and already contains query/format/limit
-                    response = requests.get(next_url, headers=headers, timeout=REQUEST_TIMEOUT)
-                    # Reset params so it's only used for the first page
-                    params = {} 
+                # First request uses params, subsequent requests use the 'next' URL directly
+                if page_index == 1:
+                     response = requests.get(next_url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
                 else:
-                    response = requests.get(next_url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+                     response = requests.get(next_url, headers=headers, timeout=REQUEST_TIMEOUT)
 
                 response.raise_for_status()
                 data = response.json()
                 page_results = data.get("results", [])
                 logs.extend(page_results)
-                fetched += len(page_results)
                 next_url = data.get("next")
                 
-                # keep progress sane if API under/over-reports
-                progress_ratio = min(1.0, len(logs) / max(1, total_count)) if total_count else 0
-                progress_bar.progress(progress_ratio if progress_ratio > 0 else 0.01)
+                # Show progress based on pages fetched (since total is unknown)
+                progress_bar.progress(min(0.99, page_index * 0.01)) 
+            
+            # Since count is unknown, set it to the total number of records fetched
+            total_count = len(logs) 
+
 
         progress_bar.empty()
         status_text.empty()
-        return logs
+        return logs, total_count
 
     except requests.exceptions.Timeout:
         progress_bar.empty()
@@ -393,6 +416,9 @@ def fetch_logs_paginated(
     except requests.exceptions.RequestException as e:
         progress_bar.empty()
         status_text.empty()
+        # Explicitly check for 403 or 401 which may look like 'no logs found'
+        if 'response' in locals() and response.status_code in [401, 403]:
+             raise Exception(f"API Error: Authentication failed (Status {response.status_code}). Check your API Token and permissions.")
         raise Exception(f"Error fetching logs: {str(e)}")
 
 def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -477,7 +503,6 @@ with st.sidebar:
 
     endpoint_config = API_ENDPOINTS[selected_endpoint]
 
-    st.markdown("---")
 
     # Date Range with presets
     st.header("⚙️ Filters")
@@ -488,20 +513,31 @@ with st.sidebar:
         index=1 # Default to "Last 7 days"
     )
 
+    col_date1, col_date2 = st.columns(2)
+    
+
     if date_preset == "Custom":
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("From", value=(datetime.today() - timedelta(days=7)).date())
-        with col2:
-            end_date = st.date_input("To", value=datetime.today().date())
+        with col_date1:
+            start_date = st.date_input("From Date", value=(datetime.today() - timedelta(days=7)).date())
+        with col_date2:
+            end_date = st.date_input("To Date", value=datetime.today().date())
     else:
         days_back = DATE_PRESETS[date_preset]
         start_date = (datetime.today() - timedelta(days=days_back)).date()
         end_date = datetime.today().date()
-        st.caption(f"📆 From: {start_date} to {end_date}")
+        st.caption(f"📆 Default Date Range: {start_date} to {end_date}")
 
-    if start_date > end_date:
-        st.error("Start date must be before end date.")
+    
+
+    # --- INPUT VALIDATION ---
+    start_datetime_check = datetime.combine(start_date, time(0, 0))
+    
+    # Validation checks against the original intent (end of day on end_date)
+    end_datetime_boundary = datetime.combine(end_date, time(0, 0)) + timedelta(days=1)
+
+    if start_datetime_check >= end_datetime_boundary:
+        st.error("❌ Invalid date range: Start date must be before or equal to the End Date.")
+        st.stop()
 
 
     # Initialize all filter lists/dictionaries
@@ -621,17 +657,6 @@ with st.sidebar:
 
 
 # --- Main Logic ---
-if not server_url:
-    st.warning("⚠️ Please enter a valid server URL in the sidebar.")
-    st.stop()
-
-if not api_key:
-    st.warning("⚠️ Please enter your API token in the sidebar.")
-    st.stop()
-
-if start_date > end_date:
-    st.error("❌ Invalid date range.")
-    st.stop()
 
 # Build full API URL
 api_url = server_url + endpoint_config['path']
@@ -656,98 +681,67 @@ with st.expander("🔍 View Full API Request URL", expanded=False):
     st.code(full_request_url, language="text")
     st.caption("Copy this URL to test in your browser or API client (add your token header)")
 
-# --- Data Fetching Buttons (MAIN SCREEN, HORIZONTAL) ---
+# --- Data Fetching Button (MAIN SCREEN) ---
 st.markdown("### 🚀 Fetch Data")
 
 # Create a container for status messages, so we can clear/update them easily
 status_placeholder = st.empty()
 
-# Create two columns for the buttons
-col1_btn, col2_btn = st.columns(2)
+is_offset_pagination = endpoint_config.get("offset_pagination", False)
 
-# Step 1: Check count
-with col1_btn:
-    if st.button("🔢 Check Total Log Count for that query", type="primary", use_container_width=True):
+# Fetch button logic
+if st.button("📥 Fetch All Logs", type="primary", use_container_width=True):
+    try:
         status_placeholder.empty() # Clear previous status
-        with st.spinner("Counting logs..."):
-            try:
-                # Ensure correct parameters are used for the count
-                api_url_for_count = server_url + endpoint_config['path']
-                
-                # Build query based on current sidebar state
-                current_final_query = build_query(
-                    selected_actions=selected_actions,
-                    selected_log_types=selected_log_types,
-                    start_date=pd.to_datetime(start_date),
-                    end_date=pd.to_datetime(end_date),
-                    custom_query=custom_query,
-                    username=username_filter,
-                    asset_uid=asset_uid_filter,
-                    extra_filters=extra_filters
-                )
-                
-                total_count = get_total_count(api_url_for_count, api_key, current_final_query)
-                st.session_state["total_count"] = total_count
-                st.session_state["query_string"] = current_final_query
-                st.session_state["api_url"] = api_url_for_count
-                st.session_state["endpoint_name"] = selected_endpoint
-                st.session_state["offset_pagination"] = endpoint_config.get("offset_pagination", False)
+        
+        # Clear previous session data logs
+        st.session_state.pop("df_logs", None) 
+        st.session_state.pop("raw_logs", None)
 
-                if total_count == 0:
-                    status_placeholder.warning("⚠️ No logs found matching your criteria.")
-                else:
-                    st.session_state["count_status_message"] = f"✅ Found **{total_count:,} logs**"
-                    status_placeholder.success(st.session_state["count_status_message"])
+        # Recalculate query (in case filters changed since last run)
+        current_final_query = build_query(
+            selected_actions=selected_actions,
+            selected_log_types=selected_log_types,
+            start_date=pd.to_datetime(start_date),
+            end_date=pd.to_datetime(end_date),
+            custom_query=custom_query,
+            username=username_filter,
+            asset_uid=asset_uid_filter,
+            extra_filters=extra_filters
+        )
 
-            except Exception as e:
-                status_placeholder.error(f"❌ API Error: {e}")
-                st.session_state.pop("total_count", None)
+        st.info(f"Fetching logs with page size {PAGE_SIZE:,}...")
 
-# Display count status message if available
-if "total_count" in st.session_state and st.session_state["total_count"] > 0:
-    total_count = st.session_state["total_count"]
-    # Redraw the status message on rerun if the count is stored
-    if "count_status_message" in st.session_state:
-        status_placeholder.success(st.session_state["count_status_message"])
-    
-    with col2_btn:
-        if st.button(f"📥 Fetch All {total_count:,} Logs", type="primary", use_container_width=True):
-            try:
-                status_placeholder.empty() # Clear the "Found X logs" message
-                
-                if total_count > 50000:
-                    st.warning(f"⚠️ Large dataset ({total_count:,} logs). Fetching may take several minutes.")
 
-                logs = fetch_logs_paginated(
-                    st.session_state.get("api_url"),
-                    api_key,
-                    st.session_state.get("query_string"),
-                    total_count,
-                    use_offset_pagination=st.session_state.get("offset_pagination")
-                )
+        logs, total_count = fetch_logs_paginated(
+            api_url, 
+            api_key,
+            current_final_query,
+            use_offset_pagination=is_offset_pagination
+        )
 
-                if not logs:
-                    st.warning("⚠️ No logs retrieved.")
-                    st.session_state.pop("df_logs", None) 
-                    st.stop()
+        if not logs:
+            status_placeholder.warning("⚠️ No logs retrieved.")
+            st.stop()
 
-                status_placeholder.success(f"✅ Retrieved {len(logs):,} logs")
+        status_placeholder.success(f"✅ Retrieved {len(logs):,} logs")
 
-                with st.spinner("Processing for analysis..."):
-                    df_logs = pd.json_normalize(logs, sep='.')
-                    df_logs = process_dataframe(df_logs)
-                    st.session_state["df_logs"] = df_logs
-                    st.session_state["raw_logs"] = logs
-                    
-                    # Clear fetching state variables after successful fetch
-                    st.session_state.pop("total_count", None)
-                    st.session_state.pop("count_status_message", None)
-                    st.session_state.pop("query_string", None)
+        with st.spinner("Processing for analysis..."):
+            df_logs = pd.json_normalize(logs, sep='.')
+            df_logs = process_dataframe(df_logs)
+            st.session_state["df_logs"] = df_logs
+            st.session_state["raw_logs"] = logs
+            st.session_state["endpoint_name"] = selected_endpoint # Store name for analysis headers
+            
+            # Clear fetching state variables
+            st.session_state.pop("total_count", None)
+            st.session_state.pop("count_status_message", None)
+            st.session_state.pop("query_string", None)
+            st.session_state.pop("api_url", None)
 
-            except Exception as e:
-                status_placeholder.error(f"❌ Error during fetch: {e}")
-                st.session_state.pop("total_count", None)
-                st.stop()
+    except Exception as e:
+        status_placeholder.error(f"❌ Error during fetch: {e}")
+        st.stop()
 
 
 # --- Main Logic (Data Analysis and Visualization) ---
@@ -756,7 +750,7 @@ if "total_count" in st.session_state and st.session_state["total_count"] > 0:
 if "df_logs" in st.session_state:
     df_logs = st.session_state["df_logs"]
     raw_logs = st.session_state["raw_logs"]
-    endpoint_name = st.session_state.get("endpoint_name", "Logs")
+    endpoint_name = st.session_state.get("endpoint_name", selected_endpoint) # Use selected_endpoint if not in state
 
     st.markdown("---")
     st.markdown(f"## 📊 {endpoint_name} - Data Analysis")
@@ -768,14 +762,24 @@ if "df_logs" in st.session_state:
     with col1:
         st.metric("Total Logs", f"{len(df_logs):,}")
     with col2:
-        user_col = "username" if "username" in df_logs.columns else "user" if "user" in df_logs.columns else None
-        if user_col and df_logs[user_col].nunique() > 0:
-            st.metric("Unique Users", f"{df_logs[user_col].nunique():,}")
+        # Check for user column variants
+        user_col = None
+        for col in ["user.username", "username", "user"]:
+            if col in df_logs.columns:
+                user_col = col
+                break
+
+        # Count unique users, ignoring NaN/None which can occur if user field is missing
+        if user_col is not None and df_logs[user_col].notna().any():
+            unique_users = df_logs[user_col].nunique()
+            st.metric("Unique Users", f"{unique_users:,}")
         else:
             st.metric("Unique Users", "N/A")
     with col3:
         if "action" in df_logs.columns:
             st.metric("Action Types", f"{df_logs['action'].nunique()}")
+        else:
+            st.metric("Action Types", "N/A")
     with col4:
         if date_col and not df_logs[date_col].empty:
             date_range = (df_logs[date_col].max() - df_logs[date_col].min()).days
@@ -788,7 +792,7 @@ if "df_logs" in st.session_state:
     search_term = st.text_input("Search in all columns:", key="search_input")
 
     if search_term:
-        mask = df_logs.astype(str).apply(lambda row: row.str.contains(search_term, case=False).any(), axis=1)
+        mask = df_logs.astype(str).apply(lambda row: row.str.contains(search_term, case=False, na=False).any(), axis=1)
         filtered_df = df_logs[mask]
         st.info(f"Found {len(filtered_df):,} matching rows")
     else:
@@ -805,23 +809,30 @@ if "df_logs" in st.session_state:
 
     with viz_col1:
         if date_col:
-            df_logs['date_only'] = pd.to_datetime(df_logs[date_col]).dt.date
-            df_logs['hour'] = pd.to_datetime(df_logs[date_col]).dt.hour
+            # Ensure the date column is used correctly and handle potential errors
+            try:
+                # Use .dt.normalize() to get rid of time components before groupby, ensuring clean daily counts
+                df_logs['date_only'] = df_logs[date_col].dt.normalize().dt.date
+                daily_counts = df_logs.groupby('date_only').size().reset_index(name='count')
+                
+                fig1 = px.line(
+                    daily_counts,
+                    x='date_only',
+                    y='count',
+                    title=f"📅 {endpoint_name} Over Time (Daily)",
+                    markers=True
+                )
+                fig1.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Number of Logs",
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig1, use_container_width=True, key="time_chart")
+            except Exception as e:
+                st.warning(f"Could not generate time series chart: {e}")
+        else:
+             st.warning("Cannot generate time series chart: Date column not found.")
 
-            daily_counts = df_logs.groupby('date_only').size().reset_index(name='count')
-            fig1 = px.line(
-                daily_counts,
-                x='date_only',
-                y='count',
-                title=f"📅 {endpoint_name} Over Time",
-                markers=True
-            )
-            fig1.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Number of Logs",
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig1, use_container_width=True, key="time_chart")
 
     with viz_col2:
         if "action" in df_logs.columns:
@@ -843,13 +854,22 @@ if "df_logs" in st.session_state:
             )
             fig2.update_traces(textposition='outside')
             st.plotly_chart(fig2, use_container_width=True, key="action_chart")
+        else:
+             st.warning("Cannot generate action chart: 'action' column not found.")
 
     # Row 2: User activity and total action breakdown
     viz_col3, viz_col4 = st.columns(2)
 
     with viz_col3:
-        user_col = "username" if "username" in df_logs.columns else "user" if "user" in df_logs.columns else None
-        if user_col and df_logs[user_col].nunique() > 0:
+        # Use the same 'user_col' logic as in the metrics section
+        user_col = None
+        for col in ["user.username", "username", "user"]:
+            if col in df_logs.columns:
+                user_col = col
+                break
+
+        if user_col is not None and df_logs[user_col].notna().any():
+            # Fill NA values temporarily for counting, then count the non-NA unique users
             user_counts = df_logs[user_col].value_counts().head(15).reset_index()
             user_counts.columns = [user_col, 'count']
             fig3 = px.bar(
@@ -866,32 +886,33 @@ if "df_logs" in st.session_state:
                 yaxis_title="Username",
                 xaxis_title="Activity Count",
                 showlegend=False,
-                height=500
+                height=500,
+                yaxis={'categoryorder':'total ascending'}
             )
             st.plotly_chart(fig3, use_container_width=True, key="user_chart")
+        else:
+             st.warning("Cannot generate user chart: User column not found or no unique users.")
 
     with viz_col4:
         # Total Action Breakdown (across ALL users)
         if "action" in df_logs.columns:
-            # Use value_counts on 'action' to get the total count for each action, irrespective of user
             total_action_counts = df_logs['action'].value_counts().reset_index()
             total_action_counts.columns = ['action', 'count']
 
-            fig_total_actions = px.bar(
+            fig_total_actions = px.pie(
                 total_action_counts,
-                x='action',
-                y='count',
-                color='count',
-                title="🌐 Actions Breakdown (All Users)",
-                text='count'
+                names='action',
+                values='count',
+                title="🌐 Actions Breakdown (All Logs)",
             )
+            fig_total_actions.update_traces(textposition='inside', textinfo='percent+label')
             fig_total_actions.update_layout(
-                xaxis_title="Action",
-                yaxis_title="Count",
-                showlegend=False,
-                xaxis={'categoryorder':'total descending'}
+                 showlegend=True,
+                 height=500
             )
             st.plotly_chart(fig_total_actions, use_container_width=True, key="total_action_chart")
+        else:
+             st.warning("Cannot generate action breakdown: 'action' column not found.")
 
     # --- Download Section ---
     st.markdown("---")
@@ -900,11 +921,11 @@ if "df_logs" in st.session_state:
 
     export_df = create_export_dataframe(df_logs)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename_base = f"kobo_{selected_endpoint.lower().replace(' ', '_')}_{timestamp}"
+    filename_base = f"kobo_{endpoint_name.lower().replace(' ', '_')}_{timestamp}"
 
-    col1, col2, col3 = st.columns(3)
+    col1_dl, col2_dl, col3_dl = st.columns(3)
 
-    with col1:
+    with col1_dl:
         csv_data = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📄 Download CSV",
@@ -914,18 +935,19 @@ if "df_logs" in st.session_state:
             use_container_width=True
         )
 
-    with col2:
+    with col2_dl:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            sheet_name = selected_endpoint.replace(" ", "_")[:31] # Max 31 chars
+            sheet_name = endpoint_name.replace(" ", "_")[:31] # Max 31 chars
             export_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
             workbook = writer.book
             worksheet = writer.sheets[sheet_name]
 
             for i, col in enumerate(export_df.columns):
-                col_width = max(export_df[col].astype(str).map(len).max(), len(col)) + 2
-                worksheet.set_column(i, i, min(col_width, 50))
+                # Calculate column width, max 50 characters
+                col_width = min(max(export_df[col].astype(str).str.len().max() if not export_df[col].empty else 1, len(col)) + 2, 50)
+                worksheet.set_column(i, i, col_width)
 
             header_format = workbook.add_format({
                 'bold': True,
@@ -942,7 +964,7 @@ if "df_logs" in st.session_state:
             use_container_width=True
         )
 
-    with col3:
+    with col3_dl:
         json_data = json.dumps(raw_logs, indent=2)
         st.download_button(
             label="🧾 Download JSON",
